@@ -285,39 +285,39 @@ sequenceDiagram
   алгоритмы, health checks, sticky sessions
 - [ ] [Выбор базы данных](../01-building-blocks/databases.md) — SQL vs NoSQL, ACID vs
   BASE, индексы, access patterns
-- [ ] [Репликация и шардирование](../01-building-blocks/replication-and-sharding.md) —
+- [ ] [Репликация и шардирование](../01-building-blocks/sharding.md) —
   leader-follower, failover, ключ шардирования, resharding
-- [ ] [Consistent hashing](../01-building-blocks/consistent-hashing.md) — виртуальные
+- [ ] [Consistent hashing](../01-building-blocks/sharding.md) — виртуальные
   узлы, равномерность, горячие партиции
 - [ ] [Очереди сообщений](../01-building-blocks/message-queues.md) — Kafka/RabbitMQ,
   at-least-once, outbox, DLQ, backpressure
-- [ ] [CAP-теорема](../01-building-blocks/cap-theorem.md) — CP vs AP, PACELC, выбор под
+- [ ] [CAP-теорема](../01-building-blocks/cap-and-consistency.md) — CP vs AP, PACELC, выбор под
   NFR
 - [ ] [Rate limiting](../01-building-blocks/rate-limiting.md) — token bucket, sliding
   window, распределённый лимитер
 - [ ] [API-дизайн](../01-building-blocks/api-design.md) — REST vs GraphQL vs gRPC,
   идемпотентность, пагинация, версионирование
-- [ ] [Числа для оценок](./estimation-numbers.md) — latency numbers, формулы RPS/storage,
+- [ ] [Числа для оценок](./numbers.md) — latency numbers, формулы RPS/storage,
   размеры единиц
 
 Тренировочные кейсы (три самых частотных типа задач + классика):
 
-- [ ] [Бронирование билетов (Ticketmaster)](../02-case-studies/design-ticket-booking.md) —
+- [ ] [Бронирование билетов (Ticketmaster)](../02-case-studies/ticket-booking.md) —
   транзакционная система, strong consistency, холды
-- [ ] [Лента Twitter](../02-case-studies/design-twitter-feed.md) — fanout on write vs
+- [ ] [Лента Twitter](../02-case-studies/twitter-feed.md) — fanout on write vs
   on read, celebrities problem
-- [ ] [Мессенджер (WhatsApp)](../02-case-studies/design-messenger.md) — WebSockets,
+- [ ] [Мессенджер (WhatsApp)](../02-case-studies/chat-messenger.md) — WebSockets,
   доставка, ordering сообщений
-- [ ] [Uber / такси](../02-case-studies/design-uber.md) — геопоиск, matching, location
+- [ ] [Uber / такси](../02-case-studies/ride-sharing.md) — геопоиск, matching, location
   updates
-- [ ] [Сокращатель ссылок](../02-case-studies/design-url-shortener.md) — разминочный
+- [ ] [Сокращатель ссылок](../02-case-studies/url-shortener.md) — разминочный
   кейс на весь шаблон за 20 минут
 
 Формат и разборы:
 
 - [ ] [Как проходит интервью: формат и критерии](../00-how-to-pass/interview-framework.md)
-- [ ] [Разбор мока: система хранения файлов](../03-mock-breakdowns/file-storage-mock.md)
-- [ ] [Разбор мока: лента Twitter](../03-mock-breakdowns/twitter-feed-mock.md)
+- [ ] [Разборы реальных мок-собеседований](../03-mock-breakdowns/mock-analysis.md) —
+  в т.ч. система хранения файлов и лента Twitter
 
 ---
 

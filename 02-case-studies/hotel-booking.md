@@ -350,7 +350,7 @@ sequenceDiagram
     participant PS as Payment Service
 
     C->>BS: POST /bookings (idempotency-key)
-    BS->>DB: BEGIN; UPDATE inventory -1; INSERT booking RESERVED
+    BS->>DB: BEGIN, UPDATE inventory -1, INSERT booking RESERVED
     DB-->>BS: COMMIT ok
     BS->>R: SET hold:b-991 booking_id EX 600
     BS-->>C: 201 RESERVED, expires_at, payment_url
@@ -362,7 +362,7 @@ sequenceDiagram
 
     Note over R: Если за 600s оплаты не было —<br/>TTL истекает, ключ удаляется
     R-->>BS: keyspace notification expired (или sweeper-поллер)
-    BS->>DB: UPDATE booking SET status=CANCELLED;<br/>UPDATE inventory +1 (только если status=RESERVED)
+    BS->>DB: UPDATE booking SET status=CANCELLED,<br/>UPDATE inventory +1 (только если status=RESERVED)
 ```
 
 Детали, за которые дают плюс:

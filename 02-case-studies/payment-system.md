@@ -345,7 +345,7 @@ sequenceDiagram
     participant K as Kafka
     participant C as Consumers
 
-    W->>DB: BEGIN; UPDATE payments SET status='CAPTURED'; INSERT INTO outbox (...); COMMIT
+    W->>DB: BEGIN, UPDATE payments SET status='CAPTURED', INSERT INTO outbox (...), COMMIT
     Note over W,DB: одна локальная транзакция — атомарно
     R->>DB: poll новых записей outbox (или CDC по WAL)
     R->>K: publish событие
