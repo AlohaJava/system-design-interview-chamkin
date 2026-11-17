@@ -1,8 +1,12 @@
 # Разбор задачи: проектирование CI/CD системы (свой GitHub Actions)
 
+<!-- learning-nav:start -->
+[← Все разделы](../README.md) · [Предыдущая тема](monitoring-system.md) · [Следующая тема →](ad-click-aggregation.md)
+<!-- learning-nav:end -->
+
 > **Формулировка на собеседовании:** «Спроектируй распределённую CI/CD систему в стиле GitHub Actions: система реагирует на `git push`, читает YAML-описание workflow из репозитория, планирует и выполняет джобы в изолированном окружении и стримит логи и статусы пользователю в реальном времени».
 >
-> Задача встречается на собеседованиях в Meta, OpenAI, Stripe и крупных российских компаниях (в формате «спроектируй систему сборки/деплоя»). Это одна из лучших задач для проверки понимания очередей, оркестрации, идемпотентности и fault tolerance — всё это «настоящая» распределённая система, а не CRUD с кэшем.
+> В кейсе проверяем оркестрацию, границы доверия, учёт попыток и восстановление после сбоев. Конкретный масштаб ниже — учебные допущения.
 
 ## Почему задача сложнее, чем звучит
 
@@ -10,11 +14,11 @@
 
 - **10k+ одновременных пайплайнов**, всплески нагрузки ×10 (merge train в понедельник утром, ночные регрессии).
 - **Multi-tenancy и fairness**: сотни команд на одной платформе, нельзя дать одному репозиторию «съесть» весь кластер (noisy neighbor).
-- **Воркеры падают посреди джобы** — нужны retry, таймауты, отмена без «зомби» и без двойного выполнения.
+- **Воркеры падают посреди джобы** — нужны retry, таймауты, отмена и защита внешних эффектов от повторов.
 - **Логи и статусы в реальном времени** — пользователь ждёт `tail -f` в браузере, а джоба может писать тысячи строк в секунду.
 - **Секреты, артефакты, кэш, изоляция** — безопасность и воспроизводимость сборок.
 
-Типичные deep-dive вопросы интервьюера (реальные формулировки из разборов):
+Вопросы для самостоятельного deep dive (учебные формулировки):
 
 - «Несколько пользователей запушили одновременно — как оркеструешь и приоритизируешь сборки, чтобы минимизировать задержки?»
 - «Команды делят одну платформу — как изолируешь пайплайны, обеспечиваешь fairness и защищаешься от noisy neighbor?»
@@ -61,14 +65,14 @@
 Исходные допущения — проговорите их вслух и зафиксируйте с интервьюером:
 
 - **10 pushes/sec** → `10 × 86400 ≈ 864k workflow runs/день`.
-- Средняя длительность workflow — **15 минут** → concurrency = `10/s × 900s ≈ 9k ≈ 10k активных runs` (закон Литтла: `L = λ × W`).
-- В одном workflow в среднем **7 джоб**, часть параллельно → одновременно выполняется **~15–20k задач**, в пике (×10, merge trains, ночные регрессии) — **100k+**.
-- **Логи**: джоба пишет в среднем ~50 строк/сек × ~200 байт → `20k × 50 × 200B ≈ 200 MB/s` в steady state, ~1–2 GB/s в пике. За день — порядка 10–15 TB сырых логов, после gzip (×10) — ~1–1.5 TB/день. Kafka справляется с таким потоком на обычном кластере.
+- Среднее время workflow в системе, включая ожидание, — **15 минут** → concurrency = `10/s × 900s ≈ 9k ≈ 10k активных runs` (закон Литтла: `L = λ × W`).
+- В одном workflow **7 джоб**, среднее фактическое время одной попытки **240 секунд**, без retry: `10 × 7 × 240 = 16 800` выполняющихся задач. Число джоб и длительность workflow сами по себе не определяют concurrency задач. В устойчивом пике ×10 понадобилось бы 168k слотов; при недостатке слотов растут очередь и время workflow.
+- **Логи**: джоба пишет в среднем ~50 строк/сек × ~200 байт → `20k × 50 × 200B ≈ 200 MB/s` в steady state, ~1–2 GB/s в пике. Это 17,28 TB/сутки при постоянных 20k джоб; сжатие ×10 — гипотеза, дающая ~1,73 TB/сутки. Размер Kafka-кластера выводят из теста, replication factor, retention и запаса, а не из слова «обычный».
 - **Артефакты**: 20% runs сохраняют ~100 MB → `864k × 0.2 × 100MB ≈ 17 TB/день`; retention 30 дней → ~0.5 PB в объектном хранилище. Это нормально для S3-подобного стора.
-- **Метаданные**: на run ~7 джоб × ~2 попытки × ~4 перехода состояний ≈ 50–60 строк в БД → **~50M строк/день**. Значит, таблицы попыток и событий нужно партиционировать по времени и чистить/архивировать по TTL.
-- **SLO триггера**: провайдер вебхуков (GitHub) ждёт ответ ~10 сек, но повторяет доставку при любом сбое → ACK надо отдавать за ≤ 2 сек, всё тяжёлое — асинхронно.
+- **Метаданные**: при среднем 1,1 попытки на джобу получим `864k × 7 × 1,1 ≈ 6,65M task_attempt/день` и при 4 событиях на попытку ~26,6M execution_event/день. Строки попыток и событий — разные величины. При 2 попытках это 12,1M и 48,4M соответственно, а также удвоенная нагрузка исполнения. Retention и индексы оцениваем по каждой таблице.
+- **SLO триггера**: GitHub требует 2xx в пределах 10 секунд; внутренний бюджет ACK ≤ 2 секунд оставляет запас. Автоматического redelivery неудавшихся webhook у GitHub нет: нужен наш процесс redelivery/reconciliation.
 
-Эти числа сразу дают три архитектурных следствия: (1) ingestion должен быть асинхронным и буферизованным; (2) одна глобальная очередь не выдержит — нужны шардированные очереди; (3) состояние нельзя держать в памяти планировщика — нужна durable metadata DB.
+Эти числа сразу дают три архитектурных следствия: (1) ingestion должен быть асинхронным и буферизованным; (2) fairness и capacity очереди проверяются отдельно, шардирование вводится по необходимости; (3) состояние нельзя держать в памяти планировщика — нужна durable metadata DB.
 
 ## API
 
@@ -91,67 +95,28 @@ POST /v1/repos/{repo}/secrets               # запись секрета (write
 
 Ключевые решения, которые стоит озвучить:
 
-- Webhook отвечает **202 Accepted**, а не 200 после обработки — «acknowledge first, process later». Это главный приём против таймаутов и ретраев провайдера.
-- Логи — **SSE (Server-Sent Events)**, не WebSocket: однонаправленный стрим, дешевле держать тысячи соединений, автоматический reconnect с `Last-Event-ID`.
+- Webhook отвечает **202 Accepted** после durable-приёма — «acknowledge first, process later». Это главный приём против таймаутов и ретраев провайдера.
+- Логи — **SSE (Server-Sent Events)**, не WebSocket: однонаправленный стрим, дешевле держать тысячи соединений, reconnect с `Last-Event-ID`; сервер должен уметь воспроизвести пропущенные записи.
 - Секреты — **write-only**: API позволяет записать/обновить, но не прочитать.
 
 ## High-level design
 
 ```mermaid
-flowchart LR
-    subgraph Producers["Источники событий"]
-        Dev["Developer git push"]
-        PR["Pull Request"]
-        Cron["Nightly cron"]
-    end
-
-    GW["API Gateway auth HMAC rate limit"]
-    DD["Dedup Redis SETNX"]
-    WQ[("Webhook Queue Kafka")]
-    ING["Ingress Service parse validate build DAG"]
-    GF["Git Fetcher shallow clone by SHA"]
-    MDB[("Metadata DB PostgreSQL")]
-    SCH["Scheduler ready tasks"]
-    ORCH["Central Orchestrator"]
-    JQ[("Partitioned Job Queue by tenant shard")]
-    AS["Autoscaler and hot shard detector"]
-    REC["Reconciler timeout manager"]
-
-    subgraph Workers["Runner Fleet stateless"]
-        W1["Runner pool spot"]
-        W2["Runner pool on demand"]
-    end
-
-    S3[("Object Storage S3 artifacts logs raw webhooks")]
-    LQ[("Log Ingestion Queue Kafka")]
-    PS["Pub/Sub Redis"]
-    UI["Web UI SSE"]
-    SI[("Search Index logs")]
-
-    Dev --> GW
-    PR --> GW
-    Cron --> SCH
-    GW --> DD --> WQ --> ING
-    ING --> GF
-    ING --> MDB
-    ING -.->|"raw webhook replay log"| S3
-    SCH --> MDB
-    SCH --> ORCH --> JQ
-    JQ --> W1
-    JQ --> W2
-    AS --> JQ
-    AS --> Workers
-    REC --> MDB
-    W1 --> LQ
-    W2 --> LQ
-    W1 -->|"artifacts"| S3
-    W2 -->|"artifacts"| S3
-    LQ --> PS --> UI
-    LQ --> S3
-    LQ --> SI
-    W1 -->|"status heartbeat"| MDB
-    W2 -->|"status heartbeat"| MDB
+flowchart TB
+    G[Git provider] --> I[Webhook API]
+    I --> DB[(Inbox + metadata)]
+    DB --> D[DAG builder]
+    D --> DB
+    DB --> Q[(Ready queue)]
+    Q --> W[Runner fleet]
+    W --> A[(Artifacts)]
+    W --> L[Log pipeline]
+    L --> U[UI]
+    W --> DB
+    R[Reconciler] --> DB
 ```
+
+Inbox/outbox связывают durable metadata с очередью; стрелка БД → queue означает фоновую публикацию outbox. Autoscaler следит за backlog и насыщением runner pools, а scheduler применяет квоты до выдачи lease. Подробный путь логов показан отдельно.
 
 Система делится на четыре плоскости — это удобный каркас для рассказа:
 
@@ -164,45 +129,27 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant D as Developer
-    participant G as Git Provider
-    participant A as API Gateway
-    participant R as Redis Dedup
-    participant K as Kafka Webhook Queue
-    participant I as Ingress Service
-    participant F as Git Fetcher
-    participant M as Metadata DB
+    participant G as Git provider
+    participant A as Webhook API
+    participant D as DB inbox
+    participant I as DAG builder
     participant S as Scheduler
-
-    D->>G: git push
-    G->>A: POST webhook plus HMAC signature plus delivery id
-    A->>A: verify HMAC SHA256 signature
-    A->>R: SETNX delivery id TTL 72h
-    alt duplicate delivery
-        R-->>A: key exists
-        A-->>G: 202 Accepted skip
-    else first delivery
-        R-->>A: OK
-        A->>K: enqueue raw event
-        A-->>G: 202 Accepted within 2s
-        A->>I: async consume
-        I->>K: poll event
-        I->>F: fetch workflow yaml pinned to commit SHA
-        F-->>I: yaml content
-        I->>I: validate and parse into DAG
-        I->>M: insert workflow_run plus tasks
-        M-->>S: poll ready tasks
-    end
+    G->>A: webhook + signature + delivery_id
+    A->>A: проверить HMAC и тип события
+    A->>D: INSERT inbox UNIQUE(provider, delivery_id)
+    D-->>A: COMMIT / уже принято
+    A-->>G: 202 Accepted
+    I->>D: взять необработанный inbox
+    I->>I: fetch YAML по commit SHA, validate
+    I->>D: TX: run + tasks + outbox + processed
+    S->>D: читать ready/outbox
 ```
 
-Разбор блоков (именно так стоит рассказывать — «нарезаем требование на блоки и прикладываем принципы к каждому»):
+Подпись подтверждает источник и целостность payload, но сама не предотвращает replay. Уникальный `delivery_id` проверяется в durable inbox, а повтор с иным payload отклоняется. Commit SHA не является уникальным ID запуска: один commit можно запустить вручную несколько раз, а разные события могут иметь разные workflow.
 
-1. **Аутентификация**: HMAC-SHA256 подпись вебхука (схема GitHub) — защита от spoofing и replay.
-2. **Дедупликация**: провайдер гарантирует *at least once* и ретраит доставку → ключ `delivery_id` (у GitHub — `X-GitHub-Delivery` GUID) + commit SHA в Redis с TTL 72ч. Это даёт эффективную семантику *exactly once* на уровне бизнес-логики, не требуя её от транспорта.
-3. **Асинхронность**: ACK за ≤2 сек, тяжёлая работа (fetch, парсинг, построение DAG) — после постановки в Kafka. Очередь — shock absorber: даже если scheduler перегружен или перезапускается, события не теряются.
-4. **Durability first**: план запуска (run + tasks) персистится в metadata DB **до** того, как хоть одна задача будет запланирована — переживаем падение посреди ingestion.
-5. **Replay-лог**: каждый сырой webhook дополнительно пишется в S3 (аудит, отладка, возможность перепроиграть события в Kafka после инцидента).
+ACK отправляется после commit inbox; тяжёлый fetch и построение DAG идут в фоне. Если API упал после commit до ответа, redelivery увидит тот же inbox. Если DAG builder упал после записи задач, транзакция с отметкой `processed` не даст создать второй run. Передача ready-задачи в брокер идёт через outbox; иначе возможен commit задачи без enqueue. Redis может быть быстрым кэшем дедупликации, но `SETNX` до durable enqueue без связанного протокола теряет событие при сбое между ними.
+
+GitHub не обещает автоматический retry неудачной доставки. Reconciler отслеживает failed deliveries через API провайдера и инициирует redelivery либо сверяет принятые события с refs/runs. Политику и срок такой сверки согласуем отдельно. Эти гарантии не распространяются на выполнение произвольного пользовательского кода ровно один раз.
 
 ## Модель данных
 
@@ -272,25 +219,19 @@ erDiagram
 
 Зачем каждая сущность:
 
-- **`workflow_run`** — «мастер-запись» запуска: один push → один run, привязан к repo + commit SHA. Пин YAML на SHA даёт воспроизводимость: rerun старого пайплайна использует ровно тот же конфиг.
+- **`workflow_run`** — «мастер-запись» запуска: одно принятое trigger event → определённый набор runs, привязан к repo + commit SHA. Пин YAML на SHA даёт воспроизводимость: rerun старого пайплайна использует ровно тот же конфиг.
 - **`task`** — узел DAG из YAML: образ, ресурсы, рёбра зависимостей (`depends_on`), политика retry/timeout.
 - **`task_attempt`** — *каждая фактическая попытка* выполнения, включая ретраи. Это ключевое решение: без отдельной строки на попытку ретраи выглядят как «тихие переисполнения» — теряется история, аудит и защита от гонок (старая попытка не может писать, см. fencing ниже).
 - **`execution_event`** — append-only журнал всех переходов состояний (`pending → running → failed → ...`). Источник истины для аудита и восстановления после падения orchestrator'а.
 - **`artifact`**, **`log_chunk`** — связь выходов джобы с объектным хранилищем: путь, тип, хэш, TTL.
 
-Практические замечания: партиционируем `task_attempt` и `execution_event` по времени (50M строк/день), архив холодных runs — в S3. Для «живых» данных хватит PostgreSQL; нагрузка на запись — десятки тысяч TPS в пике, что для шардированного Postgres приемлемо.
+Практические замечания: партиционируем историю по времени, архивируем холодные runs. Активные попытки индексируем по lease/deadline отдельно от истории. При 16,8k задач heartbeat каждые 10 секунд даёт ещё 1680 апдейтов/с; это отдельная нагрузка. Возможности PostgreSQL проверяем по смеси запросов и contention, без универсального порога TPS.
 
 ## Deep dive 1: надёжный ingestion под всплесками
 
-Сценарий: 10:00 утра, десятки инженеров запушили в `main`, систему засыпало вебхуками. Три риска:
+Сценарий: API принял webhook, но брокер недоступен. Если ACK уже выдан, ответственность за восстановление у нашей платформы. Durable inbox хранит payload, delivery ID и статус; фоновая доставка повторяется с backoff и jitter. Очередь может отстать, но принятое событие не зависит от памяти API.
 
-| Риск | Причина | Решение |
-|------|---------|---------|
-| Потеря событий | сервер упал до персиста; провайдер stateless и «не помнит» доставку | ACK только после записи в Kafka; replay-лог сырых вебхуков в S3 |
-| Дубликаты | провайдер ретраит при любом сбое/таймауте | дедупликация по `delivery_id` в Redis (SETNX, TTL 72ч) |
-| Таймаут ответа | fetch + валидация + планирование до ответа | 202 Accepted сразу; тяжёлая работа асинхронно |
-
-Важно озвучить: «провайдер вебхуков — stateless, он не помнит, что доставил, и будет ретраить, если мы не ответили быстро». Отсюда весь дизайн блока.
+При заполнении inbox или исчерпании retention нельзя продолжать отвечать 202: нужны отказ в приёме, алерт и процедура redelivery провайдера. Меряем возраст самого старого необработанного события и долю потерянных/необработанных deliveries, а не только глубину очереди. S3-копия удобна для аудита, но не заменяет commit перед ACK.
 
 ## Deep dive 2: планировщик, очереди задач и fairness
 
@@ -305,7 +246,7 @@ erDiagram
 
 ### Шардированные очереди
 
-Вместо одной очереди — партиции по `org_id` / `repo_id` или `hash(workflow_run_id)` (consistent hashing). Разные тенанты планируются независимо: нет общего bottleneck, нет starvation, нет crosstalk. Планировщики тянут из партиций параллельно.
+Вместо одной очереди — партиции по `org_id` / `repo_id` или `hash(workflow_run_id)` (consistent hashing). Партиции увеличивают параллелизм, но сами не обеспечивают fairness: большой тенант может занять все слоты. Нужны глобальные/per-tenant лимиты running jobs, weighted fair scheduling и приоритеты. Репозитории могут делить один физический shard.
 
 ### Ready-очередь вместо полного скана DAG
 
@@ -313,7 +254,7 @@ erDiagram
 
 ### Идемпотентные переходы состояний (CAS)
 
-Каждый переход — compare-and-swap по текущему статусу:
+Каждый переход — compare-and-swap по текущему статусу; обновление строки и execution_event выполняются в одной транзакции. Enqueue downstream/retry публикуется через outbox, иначе падение после commit потеряет запуск:
 
 ```sql
 -- воркер забирает задачу: успех только если она ещё ready
@@ -323,7 +264,7 @@ WHERE attempt_id = 'a2' AND status = 'ready';
 -- affected rows = 0 → кто-то уже забрал, пропускаем
 ```
 
-Тот же приём — optimistic locking по версии строки. Это защита от двойного выполнения, устаревших апдейтов и гонок планировщиков. Сильная фраза для интервью: «все переходы состояний идемпотентны — повторная попытка с тем же намерением безвредна».
+Тот же приём — optimistic locking по версии строки. Это защита от двух успешных захватов одной ready-попытки. Потерявший lease воркер физически ещё может работать: CAS метаданных не отменяет его HTTP-запросы или деплой. Сильная фраза для интервью: «все переходы состояний идемпотентны — повторная попытка с тем же намерением безвредна».
 
 ### Autoscaler + hot shard detector
 
@@ -349,22 +290,34 @@ WHERE attempt_id = 'a2' AND status = 'ready';
 
 Каждая джоба исполняется в sandbox: запушенный код — недоверенный (в публичных репо — буквально чужой код на вашем железе).
 
-| Подход | Изоляция | Старт | Overhead | Когда |
-|--------|----------|-------|----------|-------|
-| Контейнер (Docker/K8s pod) | namespace + cgroups, общее ядро | ~100 мс | минимальный | доверенные тенанты, внутренний CI |
-| gVisor / Kata | прослойка между контейнером и ядром | ~сек | средний | компромисс |
-| microVM (Firecracker) | свой kernel per VM | ~125 мс | ~5 MB памяти на VM | multi-tenant, публичные репо |
+| Подход | Граница доверия | Ограничение |
+|---|---|---|
+| Контейнер | namespace/cgroups, общее ядро | Без privileged, host mounts и Docker socket; kernel escape остаётся риском |
+| gVisor | userspace kernel boundary | Проверять совместимость syscalls и стоимость workload |
+| Kata / microVM | отдельное ядро гостя | Нужны hardening хоста, изоляция сети и очистка диска |
 
-Референс: GitHub Actions для публичных репозиториев гоняет джобы на отдельных VM; AWS Lambda использует Firecracker. На собеседовании достаточно сказать: «контейнеры для внутренних тенантов, microVM — для недоверенного кода; выбор — trade-off между изоляцией и стоимостью».
+Время старта microVM из benchmark VMM не равно старту готовой джобы: ещё загружаются образ, сеть, зависимости и исходники. Для публичного недоверенного кода используем отдельные эфемерные окружения и пулы без доступа к инфраструктуре платформы; внутренний репозиторий тоже может содержать скомпрометированную зависимость. Self-hosted runner в VPC увеличивает последствия компрометации.
 
-Что ещё закрывает sandbox:
+Секрет выдаётся только после решения policy engine: доверенный repository/ref, разрешённое событие, среда и необходимые permissions. PR из fork не получает deploy secrets. Особенно опасно запускать код PR в привилегированном контексте `pull_request_target` или передавать его артефакты напрямую в deploy. Сборка и деплой — разные trust domains: deploy использует проверенный manifest и digest артефакта, а не произвольный путь из PR.
 
-- **Квоты**: CPU, память, диск, network egress (whitelist) — ограничиваем blast radius «злого» или багнутого скрипта.
-- **Pinned image**: образ по digest (`image@sha256:...`), а не по тегу — воспроизводимость.
-- **Секреты**: scoped до конкретного шага, инъекция через короткоживущие токены (OIDC, как `id-token` в GitHub Actions), маскирование в логах, write-only API. Секреты организации ≠ секреты репозитория ≠ секреты environment.
-- **Эфемерность**: окружение создаётся под джобу и уничтожается после — никакого состояния между runs, кроме явного кэша.
+OIDC убирает долгоживущий cloud key, но cloud trust policy должна ограничивать issuer, audience и subject (repo/ref/environment). Сам факт OIDC не делает код доверенным. В общей VM несколько шагов часто делят диск, процессы и пользователя: «секрет только в env последнего шага» не мешает предыдущему вредоносному шагу оставить перехватчик. Маскирование логов — дополнительная защита от случайной печати, оно не блокирует base64, сеть и артефакты. Для недоверенного кода секрет вовсе не выдаётся.
 
-**Кэш и артефакты.** Артефакты — иммутабельные, версионированные по SHA, с TTL (`expires_at`) — это даёт воспроизводимость, безопасный rollback и аудит. Кэш зависимостей — отдельно: ключ = хэш lock-файла (`package-lock.json`, `go.sum`), инвалидация сменой ключа, а не удалением «по времени». Cache hit rate 80%+ даёт главное ускорение CI на практике — про это часто спрашивают follow-up'ом.
+### Кэш и артефакты как граница доверия
+
+Ключ кэша включает tenant/repo, OS/архитектуру, toolchain, lockfile и **trust domain**. Untrusted PR может читать разрешённый базовый кэш, но не должен перезаписывать кэш release-сборок. Широкий restore-prefix способен вернуть чужой/старый кэш. Immutable cache entry снижает гонки, но не проверяет, кто первым его заполнил. Проверяем происхождение, права записи и digest; кэш считается ускорением, а не источником доверенных исполняемых файлов.
+
+Артефакту присваивают run/attempt, commit SHA и digest; release manifest ссылается на проверенный digest. Одинаковый commit не гарантирует одинаковую сборку, если плавают зависимости, images или сеть. Для воспроизводимости фиксируют toolchain и зависимости; для происхождения полезны attestations.
+
+### На подумать: fork PR украл deploy token
+
+Условие: PR-тесты не получают secrets. После их успеха доверенный workflow скачивает `build.tar` и запускает из него `deploy.sh` с production token. Изоляция соблюдена?
+
+<details>
+<summary>Разбор</summary>
+
+Нет: недоверенный артефакт стал кодом внутри доверенного контекста. Проверяемая сборка должна продвигать данные/образы по digest, а deploy-логика берётся из защищённого ref и не исполняет произвольные скрипты PR. Policy проверяет provenance и статус нужного commit, environment требует необходимые gates. Даже сканер и подпись, полученные самим PR, не превращают его код в доверенный.
+
+</details>
 
 ## Deep dive 4: durability — retry, таймауты, отмена
 
@@ -380,27 +333,25 @@ WHERE attempt_id = 'a2' AND status = 'ready';
 - **Всё состояние в metadata DB**: `workflow_run`, `task`, `task_attempt`, append-only `execution_event`. Scheduler stateless — после падения состояние полностью восстанавливается из БД.
 - **Retry-политика в задаче**: `max_retries` (например 3–5), экспоненциальный backoff (1s → 2s → 4s → ...), разделение ошибок на retryable (network timeout, worker lost) и non-retryable (ошибка конфигурации YAML, failed test — нет смысла повторять). Каждый retry — **новая строка `task_attempt`**, старые попытки не затираются.
 - **Reconciler (timeout manager)**: раз в 30–60 сек сканирует `SELECT ... WHERE status = 'running' AND deadline < now()`, применяет переходы `timeout`/`cancelled`. Даже если воркер испарился молча, система сама заметит «зомби».
-- **Идемпотентная отмена**: run помечается `cancelled` в БД → запущенные джобы получают SIGTERM (grace ~10 сек на слив логов) → SIGKILL → downstream-задачи помечаются `skipped`. Все переходы пишутся как события; повторная отмена безвредна, поздний retry отменённой задачи отвергается CAS'ом.
+- **Идемпотентная отмена**: run помечается `cancel_requested` в БД (новые попытки запрещены) → запущенные джобы получают SIGTERM (grace ~10 сек на слив логов) → SIGKILL → downstream-задачи помечаются `skipped`; `cancelled` фиксируется после подтверждения остановки либо отражается неопределённость lost runner. Все переходы пишутся как события; повторная отмена безвредна, поздний retry отменённой задачи отвергается CAS'ом.
 
 ### Жизненный цикл попытки (state machine)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending
-    pending --> ready : all prerequisites done
-    pending --> skipped : upstream failed or cancelled
-    ready --> running : CAS update if status equals ready
-    running --> success : exit code 0
-    running --> failed : non zero exit or heartbeat lost
-    running --> timeout : reconciler sees deadline passed
-    running --> cancelled : user cancel SIGTERM then SIGKILL
-    failed --> ready : retry_count less than max_retries with backoff
-    timeout --> ready : retryable timeout with backoff
-    success --> [*] : unblock downstream tasks
+    [*] --> ready
+    ready --> running : claim lease
+    running --> success : report + lease valid
+    running --> failed : exit error
+    running --> timeout : lease expired
+    running --> cancelled : cancel requested
+    success --> [*]
+    failed --> [*]
+    timeout --> [*]
     cancelled --> [*]
-    skipped --> [*]
-    failed --> [*] : retries exhausted mark run failed
 ```
+
+Это жизненный цикл **одной попытки**: она терминальна и не возвращается в ready. Retry создаёт новую попытку после проверки run status, retry budget и backoff. `pending`/`skipped` — состояние логической task в DAG. Lease renewal и жёсткий execution deadline — разные поля: здоровый воркер не должен бесконечно продлевать максимальное время выполнения.
 
 ### Пошаговый сценарий retry (тот самый вопрос «расскажи, как движутся данные»)
 
@@ -409,28 +360,29 @@ sequenceDiagram
     autonumber
     participant S as Scheduler
     participant M as Metadata DB
-    participant Q as Partitioned Job Queue
-    participant W1 as Worker w13
+    participant Q as Job queue
+    participant W1 as Runner A1
     participant R as Reconciler
-    participant W2 as Worker w29
+    participant W2 as Runner A2
 
-    S->>M: insert attempt A1 status running worker w13 deadline t0 plus 15m
+    S->>M: создать A1 с lease и deadline
     W1->>M: heartbeats every 10s
     Note over W1: worker crashes at t0 plus 30s
-    R->>M: scan attempts where running and deadline passed or heartbeat stale
-    R->>M: mark A1 failed append execution event
-    R->>M: evaluate DAG retries left equals 2
-    R->>Q: enqueue new attempt A2 retry_count 1 backoff 4s
+    R->>M: найти истёкший lease
+    R->>M: TX: A1 failed + event
+    R->>M: проверить run и retry budget
+    R->>Q: outbox: новая попытка A2
     Q->>W2: dispatch A2
-    W2->>M: CAS ready to running worker w29
+    W2->>M: CAS: ready → running
     Note over W1,M: fencing old attempt A1 writes rejected
-    W2->>M: exit code 0 status success logs uploaded
-    S->>M: unblock downstream tasks in DAG
+    W2->>M: TX: success + event
+    S->>M: outbox: готовые downstream tasks
 ```
 
 Три детали, которые отличают сильный ответ:
 
-- **Fencing**: старой попытке (A1) запрещено писать — все апдейты фильтруются по `attempt_id`; даже если «мёртвый» воркер ожил, он не испортит состояние.
+- **Fencing**: старой попытке (A1) запрещено писать — апдейты проверяют attempt_id, активный lease epoch и терминальный статус; даже если «мёртвый» воркер ожил, он не испортит состояние.
+- **Внешние эффекты**: fencing БД не ограждает deployment API. Получатель должен проверять epoch либо принимать idempotency key `(run, task, target)`; если не умеет, retry после неизвестного результата требует сверки, а не слепого повторения.
 - **Heartbeat от воркеров**: orchestrator узнаёт о падении за ~30 сек, а не ждёт 15-минутного дедлайна.
 - **Deadline хранится рядом с попыткой** — reconciler тупо сканирует индекс по `deadline`, ему не нужна внутренняя память. (В разборе distributed job scheduler используют тот же приём: индекс по run-timestamp даёт быстрый запрос «какие задачи пора запускать/ретраить», а исполнитель при захвате задачи продлевает отметку, чтобы задачу не ретраили, пока она честно работает.)
 
@@ -444,15 +396,15 @@ sequenceDiagram
 flowchart LR
     subgraph Runner["Runner"]
         Job["Job stdout stderr"]
-        LC["Log Collector batch tag attempt_id seq_no"]
+        LC["Log collector"]
     end
     LQ[("Log Ingestion Queue Kafka")]
     subgraph Fanout["Fanout"]
         PS["Redis Pub/Sub"]
-        SSE["SSE Gateway debounce rate limit heartbeat"]
+        SSE["SSE gateway"]
     end
     UI["Browser CLI"]
-    S3[("S3 compressed chunks logs run task attempt stdout.log.gz")]
+    S3[("Log chunks")]
     SI[("Search Index structured queries")]
 
     Job --> LC --> LQ
@@ -461,8 +413,9 @@ flowchart LR
     LQ --> SI
 ```
 
-- **Ingestion**: воркер батчит строки каждые несколько секунд, тегирует `attempt_id + seq_no` и пишет в Kafka. Kafka даёт durability, порядок и replay: даже если все клиенты отключились, стрим не потерян.
+- **Ingestion**: воркер батчит строки каждые несколько секунд, тегирует `attempt_id + seq_no` и пишет в Kafka. После broker ACK Kafka хранит принятые батчи в пределах retention; ещё не отправленный буфер погибшего runner можно потерять. Для жёсткой гарантии нужен локальный durable spool вне ephemeral sandbox, иначе UI честно показывает возможный gap.
 - **Fanout**: из Kafka события разлетаются в Redis pub/sub; UI подписан через SSE. Апдейты дебаунсятся и rate-limit'ятся, heartbeat каждые несколько секунд держит соединение живым — клиент не захлёбывается, «зомби»-соединения не копятся.
+- **Reconnect и backpressure**: Pub/Sub не хранит пропущенные события. SSE event ID содержит attempt и seq_no; reconnect дочитывает durable chunks/журнал и затем переключается на live, устраняя повторы. Slow client получает ограниченный буфер и возможность догрузки. Лимит байт/сек на джобу не даёт бесконечному stdout занять весь кластер.
 - **Storage**: по завершении (или каждые N минут) логи сжимаются и укладываются в S3 по детерминированному пути `logs/{run_id}/{task_id}/{attempt_id}/stdout.log.gz` + дублируются в поисковый индекс для структурированных запросов («покажи ERROR по всем runs ветки за неделю»).
 - **Статусы** — отдельный лёгкий канал: переходы состояний пишутся в БД и публикуются через pub/sub, UI обновляет бейджи шагов без чтения логов.
 
@@ -473,11 +426,11 @@ flowchart LR
 | Решение | Взяли | Альтернатива | Цена выбора |
 |---------|-------|--------------|-------------|
 | Модель раннеров | **Pull** (воркеры сами тянут задачи) | Push от orchestrator | нужны heartbeat и visibility timeout; зато естественный backpressure и простой autoscaling |
-| Доставка событий | At least once + идемпотентность | Exactly once | exactly once дорог и хрупок; честная идемпотентность проще и надёжнее |
+| Доставка событий | At least once + идемпотентность | Транзакционная публикация | Гарантия задаётся отдельно для каждой границы, особенно внешнего деплоя |
 | Очередь задач | Шардированные партиции по тенанту | Одна глобальная FIFO | теряем строгий глобальный FIFO-порядок — он и не нужен между тенантами |
 | Изоляция | Контейнеры (внутренние) + microVM (недоверенный код) | голые VM | VM — минуты на старт, контейнер — слабее изоляция; гибрид по уровню доверия |
-| Метаданные | PostgreSQL (транзакции, CAS) | NoSQL | нужно шардировать и партиционировать вручную на 50M строк/день |
-| Live-логи | SSE | WebSocket / polling | SSE только server→client (нам хватает), зато дёшево держать 100k соединений |
+| Метаданные | PostgreSQL (транзакции, CAS) | NoSQL | партиционирование/шардирование выбираются по профилю записи и retention |
+| Live-логи | SSE | WebSocket / polling | SSE только server→client (нам хватает), нужны connection capacity и backpressure |
 | Логи | Kafka → S3 + search index | прямая запись в БД | два хранилища = консистентность на приложении; зато БД не умирает под логами |
 | Артефакты | Иммутабельные, versioned by SHA | перезаписываемые | больше storage (нужен TTL/GC), зато воспроизводимость и rollback |
 
@@ -488,7 +441,7 @@ flowchart LR
 - **Синхронная обработка вебхука.** Если вы делаете fetch + parse + schedule до ответа GitHub — получите ретраи, дубликаты и каскадный отказ в пике.
 - **«Очередь гарантирует exactly once».** Без механизма и защиты формулировки это минус. Правильный ответ: at least once + идемпотентные переходы (CAS) + дедупликация на ingress.
 - **Состояние в памяти scheduler'а.** Падение = потеря всего. Всё состояние — в metadata DB, scheduler stateless.
-- **Одна глобальная очередь на всех.** Нет fairness, нет изоляции тенантов, единая точка contention.
+- **Одна глобальная очередь на всех.** Сама очередь не гарантирует fairness; нужны квоты и планировщик. Шардирование вводим при измеренном contention.
 - **Retry без отдельной попытки.** Затираете историю, не можете отличить flaky от стабильно падающего, старый воркер может перезаписать новое состояние (нет fencing).
 - **Джобы без таймаутов.** Зомби-джобы едят кластер вечно. Нужен reconciler с дедлайнами.
 - **Логи в БД или напрямую клиенту.** Умрёте по IOPS / потеряете логи при падении воркера.
@@ -496,13 +449,13 @@ flowchart LR
 
 ## Что спросят дополнительно (follow-up вопросы)
 
-- **Кэш сборки**: как устроен ключ кэша, как инвалидируете, как не дать одному тенанту отравить кэш другого? (Ключ = hash lock-файлов + OS + toolchain; кэш namespace'ится по репозиторию/ветке.)
+- **Кэш сборки**: как устроен ключ кэша, как инвалидируете, как не дать одному тенанту отравить кэш другого? (Ключ включает lockfiles + OS + toolchain + trust domain; отдельно проверяются права записи.)
 - **Rollback в CD**: как откатить деплой в мультисервисном окружении без каскадных падений? (Иммутабельные артефакты + версионирование релизов, деплой обратной совместимостью N/N-1, canary + автоматический откат по метрикам, запрет «рассогласованных» откатов через явный release manifest.)
 - **Merge queue / merge train**: как сериализовать проверки PR перед мерджем, не проверяя каждый по отдельности? (Очередь батчей, проверка «предиктивного» мердж-результата, eviction неудачного батча.)
 - **Приоритеты**: как обеспечить, что hotfix в прод соберётся раньше ночной регрессии? (Приоритетные очереди внутри шарда, preemption или выделенный on-demand пул.)
 - **Spot-инстансы**: что если воркер на spot отзовут посреди джобы? (Тот же механизм heartbeat + retry на другом воркере; чекпоинты кэша/артефактов для длинных сборок.)
-- **Масштаб метаданных**: 50M строк/день в `task_attempt` — как жить? (Партиции по дате, TTL-архивация в S3, отдельная «горячая» таблица активных попыток для reconciler'а.)
-- **Безопасность**: как не утечь секретом через логи? (Маскирование на стороне log collector, секреты только в env нужного шага, OIDC-токены вместо долгоживущих ключей.)
+- **Масштаб метаданных**: рост истории `task_attempt` и `execution_event` — как жить? (Партиции по дате, TTL-архивация в S3, отдельная «горячая» таблица активных попыток для reconciler'а.)
+- **Безопасность**: как не утечь секретом через логи? (Не выдавать токен недоверенному коду; ограничить permissions и OIDC trust policy. Маскирование защищает лишь от части случайных утечек.)
 - **Self-hosted runners**: как встроить раннеры клиента в его VPC? (Pull-модель решает: раннер сам ходит наружу за задачами, inbound-доступ не нужен.)
 
 ## Как подавать ответ: 5-шаговый фреймворк
@@ -515,7 +468,9 @@ flowchart LR
 4. **Свяжите диаграммой**: даже текстовая схема с подписанными ответственностями и жизненным циклом `run → task → attempt → status → logs`.
 5. **Вернитесь к deep dives** — не углубляйтесь раньше времени, а приглашайте интервьюера: «могу подробнее рассказать про retry и таймауты / про fanout логов / про fairness между тенантами — что интереснее?»
 
-## Источники и видео по теме
+<a id="источники-и-видео-по-теме"></a>
+
+## Видео по теме
 
 - [Разработка системы CI/CD — популярный вопрос на собеседовании по OpenAI и Meta (ShowOffer)](https://www.youtube.com/watch?v=y32PywFi7Ek) — основной разбор: требования, 5-шаговый фреймворк подачи, дедупликация вебхуков, шардированные очереди, reconciler, retry/timeout-сценарии, стриминг логов.
 - [Distributed Job Scheduler / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=pzDwYHRzEnk) — смежная задача: индексация по run-timestamp, продление таймстемпа исполнителем против ложных ретраев, ограничение числа retry, партиционирование.

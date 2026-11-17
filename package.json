@@ -1,0 +1,15 @@
+{
+  "name": "interview-docs-checks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node scripts/check-docs.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "github-slugger": "2.0.0",
+    "markdown-it": "15.0.3"
+  }
+}
