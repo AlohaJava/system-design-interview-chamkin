@@ -528,7 +528,6 @@ Audience snapshot определяет кандидатов, но не даёт 
 
 - [Вопрос для собеседования по проектированию системы уведомлений для обработки миллиардов пользователей](https://www.youtube.com/watch?v=CUwt9_l0DOg)
 - [Как разработать систему уведомлений / Что нужно знать для собеседований по системному проектированию](https://www.youtube.com/watch?v=0pOYU5-pXWA)
-- [Notification System Design: Handling Millions of Messages](https://www.youtube.com/watch?v=TpZ3dHb3jRE)
 - [19: Notification Service / Systems Design Interview Questions With Ex-Google SWE](https://www.youtube.com/watch?v=J-5JozlYIqI)
 - [Глубокое погружение в проектирование сервисов уведомлений с Google SWE!](https://www.youtube.com/watch?v=TpugGhXhdaU)
 - [System Design 15: Design Scalable Notifications System / SMS / OTP / Email & Push / HLD / LLD](https://www.youtube.com/watch?v=Yv9q8d11Y7k)
